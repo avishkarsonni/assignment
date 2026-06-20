@@ -27,6 +27,11 @@ def _load():
     return _model
 
 
+def warmup():
+    """Load the shared model once in the main thread before workers start."""
+    _load()
+
+
 def name(code: str) -> str:
     return _NAMES.get(code, code)
 

@@ -22,3 +22,11 @@ def document_language(valid_codes):
         (only,) = langs
         return only, NONENGLISH        # single non-English language
     return "Mixed Language", MIXED      # 2+ distinct languages
+
+
+if __name__ == "__main__":  # self-check: python classify.py
+    assert document_language([]) == ("Unknown", UNKNOWN)
+    assert document_language(["en", "en"]) == ("English", ENGLISH)
+    assert document_language(["fr", "fr"]) == ("fr", NONENGLISH)
+    assert document_language(["en", "fr"]) == ("Mixed Language", MIXED)
+    print("classify rules OK")
