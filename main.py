@@ -4,22 +4,21 @@ Graceful failure: failure is logged to ErrorLog.txt and the
 batch continues.
 """
 import argparse
+import json
 import os
 import shutil
 import sys
 import threading
-import time
-import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from types import SimpleNamespace
 
 import classify
 import detect
+import errors
 import logs
 from extract import pages_lines
 from links import is_link_only, strip_links
 
-# transient I/O errors are worth retrying; corrupted/empty PDFs are not.
-_TRANSIENT = (PermissionError, BlockingIOError, TimeoutError)
 _err_lock = threading.Lock()  # ErrorLog.txt is shared across threads
 
 
@@ -48,28 +47,6 @@ def _detect_pdf(pdf_path, output_dir, chunk_pages, verbose=False):
     return label, logs.summarize(rows)
 
 
-def _process_one(pdf_path, output_dir, chunk_pages, verbose=False, attempts=3):
-    """Worker task. Retries transient I/O, never raises — returns a result."""
-    name = os.path.basename(pdf_path)
-    last = None
-    t0 = time.perf_counter()
-    for i in range(1, attempts + 1):
-        try:
-            label, stats = _detect_pdf(pdf_path, output_dir, chunk_pages, verbose)
-            return {"name": name, "ok": True, "label": label, "stats": stats,
-                    "secs": time.perf_counter() - t0}
-        except _TRANSIENT as e:
-            last = e
-            time.sleep(0.5 * i)  # linear backoff, then retry
-        except Exception as e:    # corrupted/empty/unsupported — don't retry
-            desc = traceback.format_exc() if verbose else str(e)
-            return {"name": name, "ok": False,
-                    "etype": type(e).__name__, "desc": desc}
-    desc = f"{last} (after {attempts} tries)"
-    return {"name": name, "ok": False,
-            "etype": type(last).__name__, "desc": desc}
-
-
 def _setup_dirs(output_dir):
     for sub in (classify.ENGLISH, classify.NONENGLISH, classify.MIXED,
                 classify.UNKNOWN, "Logs"):
@@ -77,18 +54,25 @@ def _setup_dirs(output_dir):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="PDF language detection batch")
-    ap.add_argument("input", help="PDF file or folder of PDFs")
-    ap.add_argument("--output", default="Output")
-    ap.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 4))
-    ap.add_argument("--chunk-pages", type=int, default=25,
-                    help="pages held in memory at once per PDF")
-    ap.add_argument("--serial", action="store_true",
-                    help="single-threaded (easier debugging)")
-    ap.add_argument("-v", "--verbose", action="store_true",
-                    help="louder console, per-PDF log footers, breakdown in "
-                         "summary, tracebacks in ErrorLog")
-    args = ap.parse_args()
+    # SRS: fully JSON-configured. The only CLI arg is which config file to read.
+    ap = argparse.ArgumentParser(description="PDF language detection (JSON-configured)")
+    ap.add_argument("config", nargs="?", default="config.json",
+                    help="JSON config file (default: config.json)")
+    cfg_path = ap.parse_args().config
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        sys.exit(f"Config not found: {cfg_path}")
+    except json.JSONDecodeError as e:
+        sys.exit(f"Bad JSON in {cfg_path}: {e}")
+    if "input" not in cfg:
+        sys.exit(f"Config {cfg_path} missing required key: input")
+
+    # defaults for everything optional; config.json overrides.
+    args = SimpleNamespace(**{
+        "output": "Output", "workers": min(8, os.cpu_count() or 4),
+        "chunk_pages": 25, "serial": False, "verbose": False, **cfg})
 
     if os.path.isdir(args.input):
         pdfs = [os.path.join(args.input, f) for f in sorted(os.listdir(args.input))
@@ -107,7 +91,9 @@ def main():
     detect.warmup()  # load the shared model once, before threads start
 
     def run(p):
-        return _process_one(p, args.output, args.chunk_pages, args.verbose)
+        return errors.run_isolated(
+            lambda: _detect_pdf(p, args.output, args.chunk_pages, args.verbose),
+            os.path.basename(p), verbose=args.verbose)
 
     results = []
     if args.serial or len(pdfs) == 1:

@@ -1,0 +1,8 @@
+{
+  "input": "input_test",
+  "output": "Output",
+  "workers": 8,
+  "chunk_pages": 25,
+  "serial": false,
+  "verbose": false
+}
