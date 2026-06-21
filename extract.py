@@ -1,10 +1,15 @@
-"""PDF text extraction (FR-002). PyMuPDF, page by page, line by line.
-
+"""
 Pages are read in chunks of `chunk_pages`: at most that many page-texts are
 held in memory at once, so peak memory is bound by chunk size, not PDF length.
 """
 
+import re
+
 import fitz
+
+# Strip NUL and C0/C1 control chars (keep tab). PyMuPDF emits \x00 for glyphs
+# whose font has no Unicode mapping; left in, they corrupt language detection.
+_CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
 def pages_lines(pdf_path, chunk_pages=25):
@@ -25,9 +30,10 @@ def pages_lines(pdf_path, chunk_pages=25):
             for page_no, text in chunk:
                 line_no = 0
                 for raw in text.splitlines():
-                    if not raw.strip():
-                        continue  # ignore blank / whitespace-only lines
+                    clean = _CTRL.sub("", raw).strip()
+                    if not clean:
+                        continue  # blank, whitespace-only, or all-control line
                     line_no += 1
-                    yield page_no, line_no, raw.strip()
+                    yield page_no, line_no, clean
     finally:
         doc.close()

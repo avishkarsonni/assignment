@@ -1,7 +1,6 @@
 """Main module for batch PDF language detection.
 
-Graceful failure (FR-006): each PDF is isolated in try/except with a small
-retry on transient I/O errors; a failure is logged to ErrorLog.txt and the
+Graceful failure: failure is logged to ErrorLog.txt and the
 batch continues.
 """
 import argparse
@@ -10,6 +9,7 @@ import shutil
 import sys
 import threading
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import classify
@@ -23,7 +23,7 @@ _TRANSIENT = (PermissionError, BlockingIOError, TimeoutError)
 _err_lock = threading.Lock()  # ErrorLog.txt is shared across threads
 
 
-def _detect_pdf(pdf_path, output_dir, chunk_pages):
+def _detect_pdf(pdf_path, output_dir, chunk_pages, verbose=False):
     name = os.path.splitext(os.path.basename(pdf_path))[0]
     rows, valid = [], []
     for page, line_no, text in pages_lines(pdf_path, chunk_pages):
@@ -42,27 +42,32 @@ def _detect_pdf(pdf_path, output_dir, chunk_pages):
             rows.append((page, line_no, detect.name(code), pct, "Unknown"))
 
     label, folder = classify.document_language(valid)
-    logs.write_pdf_log(os.path.join(output_dir, "Logs"), name, rows, label)
+    logs.write_pdf_log(os.path.join(output_dir, "Logs"), name, rows, label,
+                       verbose=verbose)
     shutil.copy2(pdf_path, os.path.join(output_dir, folder))
-    return label
+    return label, logs.summarize(rows)
 
 
-def _process_one(pdf_path, output_dir, chunk_pages, attempts=3):
+def _process_one(pdf_path, output_dir, chunk_pages, verbose=False, attempts=3):
     """Worker task. Retries transient I/O, never raises — returns a result."""
     name = os.path.basename(pdf_path)
     last = None
+    t0 = time.perf_counter()
     for i in range(1, attempts + 1):
         try:
-            label = _detect_pdf(pdf_path, output_dir, chunk_pages)
-            return {"name": name, "ok": True, "label": label}
+            label, stats = _detect_pdf(pdf_path, output_dir, chunk_pages, verbose)
+            return {"name": name, "ok": True, "label": label, "stats": stats,
+                    "secs": time.perf_counter() - t0}
         except _TRANSIENT as e:
             last = e
             time.sleep(0.5 * i)  # linear backoff, then retry
         except Exception as e:    # corrupted/empty/unsupported — don't retry
+            desc = traceback.format_exc() if verbose else str(e)
             return {"name": name, "ok": False,
-                    "etype": type(e).__name__, "desc": str(e)}
+                    "etype": type(e).__name__, "desc": desc}
+    desc = f"{last} (after {attempts} tries)"
     return {"name": name, "ok": False,
-            "etype": type(last).__name__, "desc": f"{last} (after {attempts} tries)"}
+            "etype": type(last).__name__, "desc": desc}
 
 
 def _setup_dirs(output_dir):
@@ -80,6 +85,9 @@ def main():
                     help="pages held in memory at once per PDF")
     ap.add_argument("--serial", action="store_true",
                     help="single-threaded (easier debugging)")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="louder console, per-PDF log footers, breakdown in "
+                         "summary, tracebacks in ErrorLog")
     args = ap.parse_args()
 
     if os.path.isdir(args.input):
@@ -99,7 +107,7 @@ def main():
     detect.warmup()  # load the shared model once, before threads start
 
     def run(p):
-        return _process_one(p, args.output, args.chunk_pages)
+        return _process_one(p, args.output, args.chunk_pages, args.verbose)
 
     results = []
     if args.serial or len(pdfs) == 1:
@@ -114,7 +122,13 @@ def main():
     for r in results:
         if r["ok"]:
             success += 1
-            print(f"  {r['name']}: {r['label']}")
+            if args.verbose:
+                s = r["stats"]
+                print(f"  {r['name']}: {r['label']} "
+                      f"({s['accepted']} acc / {s['unknown']} unk / "
+                      f"{s['ignored']} link, {s['pages']} pg, {r['secs']:.2f}s)")
+            else:
+                print(f"  {r['name']}: {r['label']}")
         else:
             with _err_lock:
                 logs.append_error(error_log, r["name"], r["etype"], r["desc"])
@@ -122,7 +136,8 @@ def main():
 
     failed = len(results) - success
     logs.write_summary(os.path.join(args.output, "SummaryReport.txt"),
-                       len(results), success, failed)
+                       len(results), success, failed,
+                       details=results if args.verbose else None)
     print(f"\nTotal {len(results)} | OK {success} | Failed {failed} "
           f"-> {args.output}/")
 
